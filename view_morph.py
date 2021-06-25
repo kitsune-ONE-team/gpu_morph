@@ -1,71 +1,87 @@
-from panda3d.core import *
-from direct.gui.DirectGui import *
-from direct.showbase import ShowBase
-import struct
-from random import random
 import json
+import os
+import struct
+
+from panda3d.core import GeomEnums, Texture, TextureStage, Shader, ShaderAttrib
+
+from direct.showbase import ShowBase
 from direct.actor.Actor import Actor
 
-NUM_VERT=256*256 #a lot, don't know how many I need
+from gltf import converter
+from gltf.converter import Converter, GltfSettings
 
-def addMorph(morph_name):
-    buffer = Texture("texbuffer")
-    buffer.setup_buffer_texture(NUM_VERT, Texture.T_float, Texture.F_rgb32, GeomEnums.UH_static)
-    with open(morph_name) as f: 
-        morph=json.load(f)
-    image = memoryview(buffer.modify_ram_image())    
-    for i in range(len(morph)):
-        off = i * 12    
-        image[off:off+12] = struct.pack('fff', morph[i][0], morph[i][1], morph[i][2])
-    return buffer
 
-def setWeight(slider, model, name): 
-    model.setShaderInput(name, float(slider['value']))
+# emulate missing M_emission
+
+class VTextureStage(object):
+    M_emission = TextureStage.M_modulate
+    M_modulate = TextureStage.M_modulate
+    M_normal = TextureStage.M_normal
+    M_selector = TextureStage.M_selector
+
+    def __new__(cls, *args, **kwargs):
+        return TextureStage(*args, **kwargs)
+
+
+converter.TextureStage = VTextureStage
+
 
 base = ShowBase.ShowBase()
 
-model=Actor("index_tbn", {"idle": "idle"})
-model.reparentTo(render)
-model.setShader(Shader.load(Shader.SLGLSL, "morph_v.glsl", "morph_f.glsl"))
-model.loop("idle")
-attr = ShaderAttrib.make(Shader.load(Shader.SLGLSL, "morph_v.glsl", "morph_f.glsl"))
+gltf_data = {}
+gltf_buf = None
+
+with open('cube.glb', 'rb') as f:
+    assert f.read(4) == b'glTF'  # header
+    assert struct.unpack('<I', f.read(4))[0] == 2  # version
+    full_size = struct.unpack('<I', f.read(4))
+
+    while True:
+        chunk_size = struct.unpack('<I', f.read(4))[0]
+        chunk_type = f.read(4)
+        chunk_data = f.read(chunk_size)
+        if chunk_type == b'JSON':
+            gltf_data = json.loads(chunk_data)
+        elif chunk_type == b'BIN\000':
+            gltf_buf = chunk_data
+
+        if gltf_data and gltf_buf:
+            break
+
+settings = GltfSettings(physics_engine='bullet')
+converter = Converter(indir=os.getcwd(), outdir=os.getcwd(), settings=settings)
+converter.buffers[0] = gltf_buf
+converter.update(gltf_data, writing_bam=False)
+
+shader = Shader.load(Shader.SLGLSL, 'morph_v.glsl', 'morph_f.glsl')
+
+model = Actor(converter.active_scene.find('**/+Character'))
+model.reparentTo(base.render)
+model.setShader(shader)
+
+attr = ShaderAttrib.make(shader)
 attr = attr.setFlag(ShaderAttrib.F_hardware_skinning, True)
 model.setAttrib(attr)
-        
-fat_morph=addMorph("fat.json")
-model.setShaderInput('morph1',fat_morph)
-model.setShaderInput('weight1', 0.0)
 
-slim_morph=addMorph("slim.json")
-model.setShaderInput('morph2',slim_morph)
-model.setShaderInput('weight2', 0.0)
+for gltf_node in gltf_data['nodes']:
+    if gltf_node['name'] == 'Cube':
+        gltf_mesh = gltf_data['meshes'][gltf_node['mesh']]
+        gltf_target = gltf_mesh['primitives'][0]['targets'][0]
 
-muscle_morph=addMorph("muscle.json")
-model.setShaderInput('morph3',muscle_morph)
-model.setShaderInput('weight3', 0.0)
+        a = gltf_data['accessors'][gltf_target['POSITION']]
+        v = gltf_data['bufferViews'][a['bufferView']]
+        data = gltf_buf[v['byteOffset']:v['byteOffset'] + v['byteLength']]
 
-#add a light
-dlight = DirectionalLight('dlight')
-dlight.setColor(Vec4(1.0, 1.0, 1.0, 1.0))
-dirLight = render.attachNewNode(dlight)
-render.setLight(dirLight)
-dirLight.setPos(base.camera.getPos())
-dirLight.setHpr(base.camera.getHpr())
-dirLight.wrtReparentTo(base.camera)
-render.setShaderInput("Light", dirLight)
+        tex = Texture('texbuffer')
+        vertex_num = len(data) // 3 // 4  # vec3 of 4-byte float
+        tex.setup_buffer_texture(
+            vertex_num, Texture.T_float, Texture.F_rgb32, GeomEnums.UH_static)
 
+        image = memoryview(tex.modify_ram_image())
+        image[:] = data
 
-#add sliders
-slider1 = DirectSlider(range=(0.0,1.0), value=0.0, scale=0.5, pos=(0.0,0.0,-0.6), command=setWeight)
-slider1['extraArgs']=[slider1, model, 'weight1']
+        print(bytes(image))
 
-
-slider2 = DirectSlider(range=(0.0,1.0), value=0.0, scale=0.5, pos=(0.0,0.0,-0.7), command=setWeight)
-slider2['extraArgs']=[slider2, model, 'weight2']
-
-
-slider3 = DirectSlider(range=(0.0,1.0), value=0.0, scale=0.5, pos=(0.0,0.0,-0.8), command=setWeight)
-slider3['extraArgs']=[slider3, model, 'weight3']
-
+        model.set_shader_input('morph1', tex)
 
 base.run()
